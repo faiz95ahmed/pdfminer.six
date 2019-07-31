@@ -19,6 +19,7 @@ from .psparser import PSEOF
 from .psparser import literal_name
 from .psparser import LIT
 from .psparser import KWD
+from .settings import STRICT
 from . import settings
 from .pdftypes import PDFException
 from .pdftypes import PDFTypeError
@@ -35,6 +36,8 @@ from .pdfparser import PDFStreamParser
 from .utils import choplist
 from .utils import nunpack
 from .utils import decode_text
+import multiprocessing as mp
+import time
 
 
 log = logging.getLogger(__name__)
@@ -171,6 +174,7 @@ class PDFXRefFallback(PDFXRef):
 
     def load(self, parser):
         parser.seek(0)
+        objs_to_load = []
         while 1:
             try:
                 (pos, line) = parser.nextline()
@@ -194,27 +198,47 @@ class PDFXRefFallback(PDFXRef):
             parser.seek(pos)
             (_, obj) = parser.nextobject()
             if isinstance(obj, PDFStream) and obj.get('Type') is LITERAL_OBJSTM:
-                stream = stream_value(obj)
-                try:
-                    n = stream['N']
-                except KeyError:
-                    if settings.STRICT:
-                        raise PDFSyntaxError('N is not defined: %r' % stream)
-                    n = 0
-                parser1 = PDFStreamParser(stream.get_data())
-                objs = []
-                try:
-                    while 1:
-                        (_, obj) = parser1.nextobject()
-                        objs.append(obj)
-                except PSEOF:
-                    pass
-                n = min(n, len(objs)//2)
-                for index in range(n):
-                    objid1 = objs[index*2]
-                    self.offsets[objid1] = (objid, index, 0)
+                objs_to_load.append(obj)
+        self.process_objs(objs_to_load, objid)
         return
 
+    def process_objs_sequential(self, objs_to_load, objid):
+        loaded_objs = [load_obj(obj) for obj in objs_to_load]
+        for (objs, n) in loaded_objs:
+            for index in range(n):
+                objid1 = objs[index*2]
+                self.offsets[objid1] = (objid, index, 0)
+
+    def process_objs(self, objs_to_load, objid):
+        # do multi-processing
+        nprocesses = min(4, mp.cpu_count())
+        pool = mp.Pool(processes=nprocesses)
+        loaded_objs = pool.map(load_obj, objs_to_load)
+        pool.close()  # shut down the pool
+        for (objs, n) in loaded_objs:
+            for index in range(n):
+                objid1 = objs[index*2]
+                self.offsets[objid1] = (objid, index, 0)
+
+def load_obj(obj):
+    stream = stream_value(obj)
+    print("obj:", [type(v) for v in obj.__dict__["attrs"].values()])
+    try:
+        n = stream['N']
+    except KeyError:
+        if STRICT:
+            raise PDFSyntaxError('N is not defined: %r' % stream)
+        n = 0
+    parser = PDFStreamParser(stream.get_data())
+    objs = []
+    try:
+        while 1:
+            (_, obj) = parser.nextobject()
+            objs.append(obj)
+    except PSEOF:
+        pass
+    n = min(n, len(objs)//2)
+    return (objs, n)
 
 ##  PDFXRefStream
 ##
@@ -563,7 +587,10 @@ class PDFDocument(object):
         if fallback:
             parser.fallback = True
             xref = PDFXRefFallback()
+            st=time.time()
             xref.load(parser)
+            tt=time.time()
+            print("time taken: " + str(int(tt-st)))
             self.xrefs.append(xref)
         for xref in self.xrefs:
             trailer = xref.get_trailer()
@@ -587,7 +614,7 @@ class PDFDocument(object):
             if settings.STRICT:
                 raise PDFSyntaxError('Catalog not found!')
         return
-    
+
     KEYWORD_OBJ = KWD(b'obj')
 
     # _initialize_password(password=b'')
